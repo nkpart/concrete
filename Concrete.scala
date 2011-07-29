@@ -9,16 +9,21 @@ import sbinary.DefaultProtocol._
 import SBinaryScalaz._
 
 object Concrete {
+
   trait Migrate[To, From] {
     val extended: SafeCopy[From]
 
     def migrate(ma: From): To
   }
 
-  trait Kind[A]
+  sealed trait Kind[A]
   case class Primitive[A]() extends Kind[A]
   case class Base[A]() extends Kind[A]
   case class Extends[A, From](m: Migrate[A, From]) extends Kind[A]
+
+  def extension[A, B](implicit sc: SafeCopy[A], m: Migrate[A, B]): Kind[A] = Extends(m)
+  def base[A]: Kind[A] = Base()
+  def primitive[A]: Kind[A] = Primitive()
 
   trait SafeCopy[A] {
     val version: Version = Version(0)
@@ -27,7 +32,24 @@ object Concrete {
     val getCopy: Contained[Reads[A]]
     def putCopy(a: A): Contained[Write]
 
-    lazy val internalConsistency: Consistency[A] = computeConsistency(this)
+    lazy val availableVersions: List[Int] = kind match {
+      case Primitive() => Nil
+      case Base() => version.value :: Nil
+      case Extends(m) => version.value :: m.extended.availableVersions
+    }
+
+    lazy val internalConsistency: Consistency = {
+      val versions = availableVersions
+      if (isObviouslyConsistent(kind)) {
+        Consistent
+      } else if (availableVersions != availableVersions.distinct) {
+        NotConsistent("Duplicate version tags: %s" format versions.toString)
+      } else if (!(validChain(kind))) {
+        NotConsistent("Primitive types cannot be extended as they have no version tag.")
+      } else {
+        Consistent
+      }
+    }
   }
 
   def constructGetterFromVersion[A](diskVersion: Version)(implicit safecopy: SafeCopy[A]): Reads[A] = {
@@ -39,8 +61,8 @@ object Concrete {
         case Primitive() => error("cannot migrate from primitive types")
         case Base() => error("Cannot find getter for version " + version)
         case Extends(m) => {
-          val xxx = constructGetterFromVersion(diskVersion)(m.extended)
-          xxx.map(m.migrate _)
+          val extendedReads = constructGetterFromVersion(diskVersion)(m.extended)
+          extendedReads.map(m.migrate _)
         }
       }
     }
@@ -71,12 +93,6 @@ object Concrete {
     })
   }
 
-  def extension[A, B](implicit sc: SafeCopy[A], m: Migrate[A, B]): Kind[A] = Extends(m)
-
-  def base[A]: Kind[A] = Base()
-
-  def primitive[A]: Kind[A] = Primitive()
-
   case class Version(value: Int) extends NewType[Int]
 
   object Version {
@@ -94,17 +110,11 @@ object Concrete {
   def unsafeUnPack[A](c: Contained[A]) = c.value
   def contain[A](a: A): Contained[A] = Contained(a)
 
-  trait Consistency[A]
-  case class Consistent[A]() extends Consistency[A]
-  case class NotConsistent[A](reason: String) extends Consistency[A]
+  trait Consistency
+  case object Consistent extends Consistency
+  case class NotConsistent(reason: String) extends Consistency
 
-  def availableVersions[A](implicit sc: SafeCopy[A]): List[Int] = sc.kind match {
-    case Primitive() => Nil
-    case Base() => sc.version.value :: Nil
-    case Extends(m) => sc.version.value :: availableVersions(m.extended)
-  }
-
-  def validChain[A](implicit sc: SafeCopy[A]): Boolean = sc.kind match {
+  def validChain[A](k: Kind[A]): Boolean = k match {
     case Primitive() => true
     case Base() => true
     case Extends(m) => _check(m.extended)
@@ -118,20 +128,7 @@ object Concrete {
 
   def checkConsistency[A, B, M[_]](ks: M[B])(implicit sc: SafeCopy[A],  m: Monad[M]): M[B] = sc.internalConsistency match {
     case NotConsistent(msg) => error(msg) // TODO: this is `fail` on monad in SafeCopy.
-    case Consistent() => ks
-  }
-
-  def computeConsistency[A](implicit sc: SafeCopy[A]): Consistency[A] = {
-    val versions = availableVersions
-    if (isObviouslyConsistent(sc.kind)) {
-      Consistent()
-    } else if (versions != versions.distinct) {
-      NotConsistent("Duplicate version tags: %s" format versions.toString)
-    } else if (!(validChain)) {
-      NotConsistent("Primitive types cannot be extended as they have no version tag.")
-    } else {
-      Consistent()
-    }
+    case Consistent => ks
   }
 
   def isObviouslyConsistent[A](k: Kind[A]): Boolean = k match {
@@ -149,8 +146,6 @@ object Concrete {
       def putCopy(s: String) = contain(write(s))
     }
 
-    def replicateM[A, M[_]](i: Int, ma: M[A])(implicit m: Monad[M]): M[List[A]] = ma.replicateM(i)
-
     implicit def Tuple2SafeCopy[A, B](implicit sa: SafeCopy[A], sb: SafeCopy[B]): SafeCopy[(A,B)] = new SafeCopy[Tuple2[A, B]] {
       override val kind = primitive[(A, B)]
       val getCopy = contain {
@@ -164,7 +159,7 @@ object Concrete {
     implicit def ListSC[A](implicit sc: SafeCopy[A]): SafeCopy[List[A]] = new SafeCopy[List[A]] {
       override val kind = primitive[List[A]]
       val getCopy: Contained[Reads[List[A]]] = contain {
-         get[Int] >>= { length => (getSafeGet[A] >>= (replicateM(length, _))) }
+         get[Int] >>= { length => (getSafeGet[A] >>= (_.replicateM(length))) }
       }
 
       def putCopy(xs: List[A]) = contain {
@@ -179,7 +174,6 @@ object Concrete {
     type Name = String
     type Address = String
     type Phone = String
-
 
     // Initial Version
     case class Contacts_v0(contacts: List[(Name, Address)])
