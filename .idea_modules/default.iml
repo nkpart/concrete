@@ -25,6 +25,7 @@
     <orderEntry type="sourceFolder" forTests="false" />
     <orderEntry type="library" name="org.scala-lang_scala-library_2.8.1" level="project" />
     <orderEntry type="library" name="org.scalaz_scalaz-core_2.8.1_6.0" level="project" />
+    <orderEntry type="library" name="org.scala-tools.sbinary_sbinary_2.8.1_0.4.0" level="project" />
   </component>
 </module>
 
