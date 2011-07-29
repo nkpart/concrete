@@ -2,12 +2,41 @@ package concrete
 
 import scalaz._
 import Scalaz._
-object Concrete {
 
-  trait Migrate[A, From] {
+import sbinary._
+import sbinary.DefaultProtocol._
+
+object SBinaryPimping {
+  // TODO: replace with whatever from sbinary
+  implicit val ReadsPure: Pure[Reads] = new Pure[Reads] {
+    def pure[A](a: => A): Reads[A] = new Reads[A] {
+      def reads(in: sbinary.Input): A = a
+    }
+  }
+
+  implicit val ReadsBind: Bind[Reads] = new Bind[Reads] {
+    def bind[A, B](ra: Reads[A], f: A => Reads[B]): Reads[B] = new Reads[B] {
+      def reads(in: sbinary.Input): B = {
+        val a = ra.reads(in)
+        f(a).reads(in)
+      }
+    }
+  }
+
+  implicit val ReadsFunctor: Functor[Reads] = new Functor[Reads] {
+    def fmap[A, B](r: Reads[A], f: A => B): Reads[B] = new Reads[B] {
+      def reads(in: sbinary.Input): B = f(r.reads(in))
+    }
+  }
+}
+
+import SBinaryPimping._
+
+object Concrete {
+  trait Migrate[To, From] {
     val extended: SafeCopy[From]
 
-    def migrate(ma: From): A
+    def migrate(ma: From): To
   }
 
   trait Kind[A]
@@ -15,28 +44,12 @@ object Concrete {
   case class Base[A]() extends Kind[A]
   case class Extends[A, From](m: Migrate[A, From], f: Proxy[From]) extends Kind[A]
 
-  // TODO: replace with whatever from sbinary
-  trait Get[A]
-  trait Serialize[A] {
-    val get: Get[A]
-    val putter: A => Put
-  }
-
-  object Get {
-    implicit val GetPure: Pure[Get] = null
-    implicit val GetBind: Bind[Get] = null
-    implicit val GetMonad: Monad[Get] = null
-    implicit val GetFunctor: Functor[Get] = null
-  }
-
-  trait Put
-
   trait SafeCopy[A] {
     val version: Version[A] = Version(0)
     val kind: Kind[A] = Base()
 
-    val getCopy: Contained[Get[A]]
-    def putCopy(a: A): Contained[Put]
+    val getCopy: Contained[Reads[A]]
+    //def putCopy(a: A): Contained[Put]
 
     val internalConsistency: Consistency[A] = {
       implicit val _ = this
@@ -46,7 +59,7 @@ object Concrete {
     }
   }
 
-  def constructGetterFromVersion[A: SafeCopy](diskVersion: Version[A], proxy: Proxy[A]): Get[A] = {
+  def constructGetterFromVersion[A: SafeCopy](diskVersion: Version[A], proxy: Proxy[A]): Reads[A] = {
     val safecopy = implicitly[SafeCopy[A]]
     val version = safecopy.version
     if (version == diskVersion) {
@@ -63,21 +76,22 @@ object Concrete {
     }
   }
 
-  def safeGet[A: SafeCopy]: Get[A] = getSafeGet.join
+  def safeGet[A: SafeCopy]: Reads[A] = getSafeGet.join
 
-  def getSafeGet[A](implicit sc: SafeCopy[A]): Get[Get[A]] = {
+  def getSafeGet[A](implicit sc: SafeCopy[A]): Reads[Reads[A]] = {
     val proxy = Proxy[A]()
     kindFromProxy(proxy) match {
-      case Primitive() => unsafeUnPack(sc.getCopy).pure[Get]
-      case _ => implicitly[Serialize[Version[A]]].get map { v =>
+      case Primitive() => unsafeUnPack(sc.getCopy).pure[Reads]
+      case _ => implicitly[Reads[Version[A]]] map { v =>
         constructGetterFromVersion(v, proxy)
       }
     }
   }
 
-  // TODO safePut
+//  def safePut[A: SafeCopy](a: A): Put = {
+//
+//  }
   // TODO getSafePut
-
 
   def extension[A, B](implicit sc: SafeCopy[A], m: Migrate[A, B]): Kind[A] = Extends(m, Proxy())
 
@@ -90,7 +104,7 @@ object Concrete {
   def castVersion[A, B](v: Version[A]): Version[B] = Version(v.value)
 
   object Version {
-    implicit def serialize[A]: Serialize[Version[A]] = null
+    implicit def serialize[A]: Format[Version[A]] = null
   }
 
   case class Contained[A](value: A) extends NewType[A]
@@ -153,5 +167,80 @@ object Concrete {
   object Proxy {
     def make[A](a: A): Proxy[A] = Proxy()
     def asProxyType[A](a: A, p: Proxy[A]): A = a
+  }
+
+  object Instances {
+    def get[A](implicit s: Format[A]): Reads[A] = s
+
+    implicit val StringSC = new SafeCopy[String] {
+      override val kind = primitive[String]
+      val getCopy = contain(get[String])
+    }
+
+    def replicateM[A, M[_]](i: Int, ma: M[A])(implicit m: Monad[M]): M[List[A]] = null
+
+    implicit def Tuple2SafeCopy[A, B](implicit sa: SafeCopy[A], sb: SafeCopy[B]): SafeCopy[(A,B)] = new SafeCopy[Tuple2[A, B]] {
+      override val kind = primitive[(A, B)]
+      val getCopy = contain {
+        ((a: A, b: B) => (a,b)).lift[Reads].apply(safeGet[A], safeGet[B])
+      }
+    }
+
+    implicit def ListSC[A](implicit sc: SafeCopy[A]): SafeCopy[List[A]] = new SafeCopy[List[A]] {
+      override val kind = primitive[List[A]]
+      val getCopy: Contained[Reads[List[A]]] = contain {
+         get[Int] >>= {
+           length => (getSafeGet[A] >>= (replicateM(length, _)))
+         }
+      }
+    }
+  }
+
+  object example {
+    import Instances._
+
+    type Name = String
+    type Address = String
+    type Phone = String
+
+
+    // Initial Version
+    case class Contacts_v0(contacts: List[(Name, Address)])
+    object Contacts_v0 {
+      implicit val safecopy: SafeCopy[Contacts_v0] = new SafeCopy[Contacts_v0] {
+        val getCopy = contain(safeGet[List[(Name, Address)]] map (Contacts_v0(_)))
+      }
+    }
+
+    // Subsequent update
+    case class Contact(name: Name, address: Address, phone: Phone)
+    object Contact {
+      implicit val safecopy: SafeCopy[Contact] = new SafeCopy[Contact] {
+        val getCopy = contain {
+          for (name <- safeGet[Name]; address <- safeGet[Address]; phone <- safeGet[Phone]) yield { Contact(name, address, phone) }
+        }
+      }
+    }
+
+    case class Contacts(contacts: List[Contact])
+    object Contacts {
+      implicit val safecopy: SafeCopy[Contacts] = new SafeCopy[Contacts] {
+        override val version = Version[Contacts](2)
+        override val kind = extension[Contacts, Contacts_v0]
+        val getCopy = contain(safeGet[List[Contact]].map(Contacts(_)))
+      }
+
+      implicit val m1 = new Migrate[Contacts, Contacts_v0] {
+        val extended = implicitly[SafeCopy[Contacts_v0]]
+
+        def migrate(old: Contacts_v0): Contacts = Contacts {
+          old.contacts map { case (name, address) => Contact(name, address, "") }
+        }
+      }
+    }
+  }
+
+  def main(args: Array[String]) {
+
   }
 }
