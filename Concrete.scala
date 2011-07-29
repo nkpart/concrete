@@ -3,13 +3,19 @@ package concrete
 import scalaz._
 import Scalaz._
 
-import sbinary._
 import sbinary.DefaultProtocol._
+import sbinary._
 
 object SBinaryPimping {
   case class WriteM[A](v: A, f: Function1[Output, Unit])
 
   type Write = WriteM[Unit]
+
+  implicit val WriteWritesLol: Writes[Write] = new Writes[Write] {
+    def writes(out: sbinary.Output, value: Write) {
+      value.f(out)
+    }
+  }
 
   implicit val WriteMPure: Pure[WriteM] = new Pure[WriteM] {
     def pure[A](a: => A): WriteM[A] = WriteM(a, (_ => ()))
@@ -25,7 +31,6 @@ object SBinaryPimping {
   implicit val WriteMFunctor: Functor[WriteM] = new Functor[WriteM] {
     def fmap[A, B](r: WriteM[A], f: scala.Function1[A, B]): WriteM[B] = WriteM(f(r.v), r.f)
   }
-
 
   def write[T](t: T)(implicit wr: Writes[T]): Write = WriteM((), o => wr.writes(o, t))
 
@@ -64,34 +69,33 @@ object Concrete {
   trait Kind[A]
   case class Primitive[A]() extends Kind[A]
   case class Base[A]() extends Kind[A]
-  case class Extends[A, From](m: Migrate[A, From], f: Proxy[From]) extends Kind[A]
+  case class Extends[A, From](m: Migrate[A, From]) extends Kind[A]
 
   trait SafeCopy[A] {
-    val version: Version[A] = Version(0)
+    val version: Version = Version(0)
     val kind: Kind[A] = Base()
 
     val getCopy: Contained[Reads[A]]
     def putCopy(a: A): Contained[Write]
 
-    val internalConsistency: Consistency[A] = {
+    lazy val internalConsistency: Consistency[A] = {
       implicit val _ = this
-      lazy val proxy: Proxy[A] = proxyFromConsistency(ret)
-      lazy val ret: Consistency[A] = computeConsistency(proxy)
+      val ret: Consistency[A] = computeConsistency
       ret
     }
   }
 
-  def constructGetterFromVersion[A: SafeCopy](diskVersion: Version[A], proxy: Proxy[A]): Reads[A] = {
+  def constructGetterFromVersion[A: SafeCopy](diskVersion: Version): Reads[A] = {
     val safecopy = implicitly[SafeCopy[A]]
     val version = safecopy.version
     if (version == diskVersion) {
       unsafeUnPack(safecopy.getCopy)
     } else {
-      kindFromProxy(proxy) match {
+      kindFromProxy match {
         case Primitive() => error("cannot migrate from primitive types")
         case Base() => error("Cannot find getter for version " + version)
-        case Extends(m, bProxy) => {
-          val xxx = constructGetterFromVersion(castVersion(diskVersion), bProxy)(m.extended)
+        case Extends(m) => {
+          val xxx = constructGetterFromVersion(diskVersion)(m.extended)
           xxx.map(m.migrate _)
         }
       }
@@ -101,11 +105,10 @@ object Concrete {
   def safeGet[A: SafeCopy]: Reads[A] = getSafeGet.join
 
   def getSafeGet[A](implicit sc: SafeCopy[A]): Reads[Reads[A]] = {
-    val proxy = Proxy[A]()
-    kindFromProxy(proxy) match {
+    kindFromProxy match {
       case Primitive() => unsafeUnPack(sc.getCopy).pure[Reads]
-      case _ => implicitly[Reads[Version[A]]] map { v =>
-        constructGetterFromVersion(v, proxy)
+      case _ => implicitly[Reads[Version]] map { v =>
+        constructGetterFromVersion(v)
       }
     }
   }
@@ -116,29 +119,32 @@ object Concrete {
 
   // TODO getSafePut
   def getSafePut[A](implicit sc: SafeCopy[A]): WriteM[A => Write] = {
-    val proxy = Proxy[A]
-    checkConsistency(Proxy[A](), {
-      kindFromProxy(proxy) match {
-        case Primitive() => ((a: A) => unsafeUnPack(sc.putCopy(Proxy.asProxyType(a, proxy)))).pure[WriteM]
+    checkConsistency({
+      kindFromProxy match {
+        case Primitive() => ((a: A) => unsafeUnPack(sc.putCopy(a))).pure[WriteM]
         case _ => {
-          write(versionFromProxy(proxy)) >|> ((a: A) => unsafeUnPack(sc.putCopy(Proxy.asProxyType(a, proxy)))).pure[WriteM]
+          write(versionFromProxy) >|> ((a: A) => unsafeUnPack(sc.putCopy(a))).pure[WriteM]
         }
       }
     })
   }
 
-  def extension[A, B](implicit sc: SafeCopy[A], m: Migrate[A, B]): Kind[A] = Extends(m, Proxy())
+  def extension[A, B](implicit sc: SafeCopy[A], m: Migrate[A, B]): Kind[A] = Extends(m)
 
   def base[A]: Kind[A] = Base()
 
   def primitive[A]: Kind[A] = Primitive()
 
-  case class Version[A](value: Int) extends NewType[Int]
-
-  def castVersion[A, B](v: Version[A]): Version[B] = Version(v.value)
+  case class Version(value: Int) extends NewType[Int]
 
   object Version {
-    implicit def serialize[A]: Format[Version[A]] = null
+    implicit def serialize: Format[Version] = new Format[_root_.concrete.Concrete.Version] {
+      def reads(in: sbinary.Input) = Version(implicitly[Format[Int]].reads(in))
+
+      def writes(out: Output, value: Version) {
+        implicitly[Format[Int]].writes(out, value.value)
+      }
+    }
   }
 
   case class Contained[A](value: A) extends NewType[A]
@@ -150,36 +156,36 @@ object Concrete {
   case class Consistent[A]() extends Consistency[A]
   case class NotConsistent[A](reason: String) extends Consistency[A]
 
-  def availableVersions[A: SafeCopy](p: Proxy[A]): List[Int] = kindFromProxy(p) match {
+  def availableVersions[A: SafeCopy]: List[Int] = kindFromProxy match {
     case Primitive() => Nil
-    case Base() => versionFromProxy(p).value :: Nil
-    case Extends(m, bProxy) => versionFromProxy(p).value :: availableVersions(bProxy)(m.extended)
+    case Base() => versionFromProxy.value :: Nil
+    case Extends(m) => versionFromProxy.value :: availableVersions(m.extended)
   }
 
-  def validChain[A: SafeCopy](p: Proxy[A]): Boolean = kindFromProxy(p) match {
+  def validChain[A: SafeCopy]: Boolean = kindFromProxy match {
     case Primitive() => true
     case Base() => true
-    case Extends(m, bProxy) => _check(bProxy)(m.extended)
+    case Extends(m) => _check(m.extended)
   }
 
-  def _check[A: SafeCopy](p: Proxy[A]): Boolean = kindFromProxy(p) match {
+  def _check[A: SafeCopy]: Boolean = kindFromProxy match {
     case Primitive() => true
     case Base() => true
-    case Extends(m, bProxy) => _check(bProxy)(m.extended)
+    case Extends(m) => _check(m.extended)
   }
 
-  def checkConsistency[A: SafeCopy, B, M[_]: Monad](p: Proxy[A], ks: M[B]): M[B] = consistentFromProxy(p) match {
+  def checkConsistency[A: SafeCopy, B, M[_]: Monad](ks: M[B]): M[B] = consistentFromProxy match {
     case NotConsistent(msg) => error(msg)
     case Consistent() => ks
   }
 
-  def computeConsistency[A: SafeCopy](p: Proxy[A]): Consistency[A] = {
-    lazy val versions = availableVersions(p)
-    if (isObviouslyConsistent(kindFromProxy(p))) {
+  def computeConsistency[A: SafeCopy]: Consistency[A] = {
+    val versions = availableVersions
+    if (isObviouslyConsistent(kindFromProxy)) {
       Consistent()
     } else if (versions != versions.distinct) {
       NotConsistent("Duplicate version tags: %s" format versions.toString)
-    } else if (!(validChain(p))) {
+    } else if (!(validChain)) {
       NotConsistent("Primitive types cannot be extended as they have no version tag.")
     } else {
       Consistent()
@@ -192,16 +198,9 @@ object Concrete {
     case _ => false
   }
 
-  def proxyFromConsistency[A: SafeCopy](c: => Consistency[A]): Proxy[A] = Proxy()
-  def consistentFromProxy[A: SafeCopy](p: Proxy[A]): Consistency[A] = implicitly[SafeCopy[A]].internalConsistency
-  def versionFromProxy[A: SafeCopy](p: Proxy[A]): Version[A] = implicitly[SafeCopy[A]].version
-  def kindFromProxy[A: SafeCopy](p: Proxy[A]): Kind[A] = implicitly[SafeCopy[A]].kind
-
-  case class Proxy[A]()
-  object Proxy {
-    def make[A](a: A): Proxy[A] = Proxy()
-    def asProxyType[A](a: A, p: Proxy[A]): A = a
-  }
+  def consistentFromProxy[A: SafeCopy]: Consistency[A] = implicitly[SafeCopy[A]].internalConsistency
+  def versionFromProxy[A: SafeCopy]: Version = implicitly[SafeCopy[A]].version
+  def kindFromProxy[A: SafeCopy]: Kind[A] = implicitly[SafeCopy[A]].kind
 
   object Instances {
     def get[A](implicit s: Format[A]): Reads[A] = s
@@ -212,7 +211,7 @@ object Concrete {
       def putCopy(s: String) = contain(write(s))
     }
 
-    def replicateM[A, M[_]](i: Int, ma: M[A])(implicit m: Monad[M]): M[List[A]] = null
+    def replicateM[A, M[_]](i: Int, ma: M[A])(implicit m: Monad[M]): M[List[A]] = ma.replicateM(i)
 
     implicit def Tuple2SafeCopy[A, B](implicit sa: SafeCopy[A], sb: SafeCopy[B]): SafeCopy[(A,B)] = new SafeCopy[Tuple2[A, B]] {
       override val kind = primitive[(A, B)]
@@ -268,24 +267,36 @@ object Concrete {
 
     case class Contacts(contacts: List[Contact])
     object Contacts {
-      implicit val safecopy: SafeCopy[Contacts] = new SafeCopy[Contacts] {
-        override val version = Version[Contacts](2)
-        override val kind = extension[Contacts, Contacts_v0]
-        val getCopy = contain(safeGet[List[Contact]].map(Contacts(_)))
-        def putCopy(cs: Contacts) = contain(safePut(cs.contacts))
-      }
-
+      // TODO: Fix the initialisation order dependencies of this. If the Migrate
+      // instance is declared after the SafeCopy instance, then null pointers
+      // abound.
       implicit val m1 = new Migrate[Contacts, Contacts_v0] {
         val extended = implicitly[SafeCopy[Contacts_v0]]
 
         def migrate(old: Contacts_v0): Contacts = Contacts {
-          old.contacts map { case (name, address) => Contact(name, address, "") }
+          old.contacts map {case (name, address) => Contact(name, address, "ABC")}
         }
+      }
+
+      implicit val safecopy: SafeCopy[Contacts] = new SafeCopy[Contacts] {
+        override val version = Version(2)
+        override val kind = extension[Contacts, Contacts_v0]
+        val getCopy = contain(safeGet[List[Contact]].map(Contacts(_)))
+        def putCopy(cs: Contacts) = contain(safePut(cs.contacts))
       }
     }
   }
 
   def main(args: Array[String]) {
-
+    import example._
+    println(implicitly[SafeCopy[Contacts_v0]])
+    val init = Contacts_v0(("Nick", "lolol") :: Nil)
+    println(init)
+    val writtenInit: Write = safePut(init)
+    println("Got a write")
+    val as = Operations.toByteArray(writtenInit)
+    println(as)
+    val next: Contacts = Operations.fromByteArray(as)(safeGet[Contacts])
+    println(next)
   }
 }
