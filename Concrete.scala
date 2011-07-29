@@ -7,6 +7,23 @@ import sbinary._
 import sbinary.DefaultProtocol._
 
 object SBinaryPimping {
+  case class WriteM[A](v: A, f: Function1[Output, Unit])
+
+  type Write = WriteM[Unit]
+
+  implicit val WriteMPure: Pure[WriteM] = new Pure[WriteM] {
+    def pure[A](a: => A): WriteM[A] = WriteM(a, (_ => ()))
+  }
+
+  implicit val WriteMBind: Bind[WriteM] = new Bind[WriteM] {
+    def bind[A, B](ma: WriteM[A], f: A => WriteM[B]): WriteM[B] = {
+      val WriteM(b, ab) = f(ma.v)
+      WriteM(b, (o => { ma.f(o); ab(o) } ))
+    }
+  }
+
+  def write[T](t: T)(implicit wr: Writes[T]): Write = WriteM((), o => wr.writes(o, t))
+
   // TODO: replace with whatever from sbinary
   implicit val ReadsPure: Pure[Reads] = new Pure[Reads] {
     def pure[A](a: => A): Reads[A] = new Reads[A] {
@@ -49,7 +66,7 @@ object Concrete {
     val kind: Kind[A] = Base()
 
     val getCopy: Contained[Reads[A]]
-    //def putCopy(a: A): Contained[Put]
+    def putCopy(a: A): Contained[Write]
 
     val internalConsistency: Consistency[A] = {
       implicit val _ = this
@@ -88,10 +105,22 @@ object Concrete {
     }
   }
 
-//  def safePut[A: SafeCopy](a: A): Put = {
-//
-//  }
+  def safePut[A: SafeCopy](a: A): Write = {
+    getSafePut >>= (putter => putter(a))
+  }
+
   // TODO getSafePut
+  def getSafePut[A](implicit sc: SafeCopy[A]): WriteM[A => Write] = {
+    val proxy = Proxy[A]
+    checkConsistency(Proxy[A](), {
+      kindFromProxy(proxy) match {
+        case Primitive() => ((a: A) => unsafeUnPack(sc.putCopy(Proxy.asProxyType(a, proxy)))).pure[WriteM]
+        case _ => {
+          write(versionFromProxy(proxy)) >|> ((a: A) => unsafeUnPack(sc.putCopy(Proxy.asProxyType(a, proxy)))).pure[WriteM]
+        }
+      }
+    })
+  }
 
   def extension[A, B](implicit sc: SafeCopy[A], m: Migrate[A, B]): Kind[A] = Extends(m, Proxy())
 
