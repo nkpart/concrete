@@ -22,6 +22,11 @@ object SBinaryPimping {
     }
   }
 
+  implicit val WriteMFunctor: Functor[WriteM] = new Functor[WriteM] {
+    def fmap[A, B](r: WriteM[A], f: scala.Function1[A, B]): WriteM[B] = WriteM(f(r.v), r.f)
+  }
+
+
   def write[T](t: T)(implicit wr: Writes[T]): Write = WriteM((), o => wr.writes(o, t))
 
   // TODO: replace with whatever from sbinary
@@ -204,6 +209,7 @@ object Concrete {
     implicit val StringSC = new SafeCopy[String] {
       override val kind = primitive[String]
       val getCopy = contain(get[String])
+      def putCopy(s: String) = contain(write(s))
     }
 
     def replicateM[A, M[_]](i: Int, ma: M[A])(implicit m: Monad[M]): M[List[A]] = null
@@ -213,14 +219,19 @@ object Concrete {
       val getCopy = contain {
         ((a: A, b: B) => (a,b)).lift[Reads].apply(safeGet[A], safeGet[B])
       }
+      def putCopy(t2: (A,B)) = contain {
+        safePut(t2._1) >|> safePut(t2._2)
+      }
     }
 
     implicit def ListSC[A](implicit sc: SafeCopy[A]): SafeCopy[List[A]] = new SafeCopy[List[A]] {
       override val kind = primitive[List[A]]
       val getCopy: Contained[Reads[List[A]]] = contain {
-         get[Int] >>= {
-           length => (getSafeGet[A] >>= (replicateM(length, _)))
-         }
+         get[Int] >>= { length => (getSafeGet[A] >>= (replicateM(length, _))) }
+      }
+
+      def putCopy(xs: List[A]) = contain {
+        write(xs.length) >|> { getSafePut[A] >>= (f => xs.traverse_(f)) }
       }
     }
   }
@@ -238,6 +249,7 @@ object Concrete {
     object Contacts_v0 {
       implicit val safecopy: SafeCopy[Contacts_v0] = new SafeCopy[Contacts_v0] {
         val getCopy = contain(safeGet[List[(Name, Address)]] map (Contacts_v0(_)))
+        def putCopy(cs: Contacts_v0) = contain(safePut(cs.contacts))
       }
     }
 
@@ -248,6 +260,9 @@ object Concrete {
         val getCopy = contain {
           for (name <- safeGet[Name]; address <- safeGet[Address]; phone <- safeGet[Phone]) yield { Contact(name, address, phone) }
         }
+        def putCopy(c: Contact) = contain {
+          safePut(c.name) >|> safePut(c.address) >|> safePut(c.phone)
+        }
       }
     }
 
@@ -257,6 +272,7 @@ object Concrete {
         override val version = Version[Contacts](2)
         override val kind = extension[Contacts, Contacts_v0]
         val getCopy = contain(safeGet[List[Contact]].map(Contacts(_)))
+        def putCopy(cs: Contacts) = contain(safePut(cs.contacts))
       }
 
       implicit val m1 = new Migrate[Contacts, Contacts_v0] {
