@@ -1,13 +1,19 @@
 package concrete
 
-import sbinary.{Reads, Writes, Output}
 import scalaz.{Functor, Bind, Pure}
+import sbinary.{Format, Reads, Writes, Output}
 
 object SBinaryScalaz {
-
+   // A trivial writer monad around functions Output => ()
   case class WriteM[A](v: A, f: Function1[Output, Unit])
 
   type Write = WriteM[Unit]
+
+  def read[A](implicit s: Format[A]): Reads[A] = s
+
+  def write[T](t: T)(implicit wr: Writes[T]): Write = WriteM((), o => wr.writes(o, t))
+
+  // Typeclass Instances
 
   implicit val WriteWritesLol: Writes[Write] = new Writes[Write] {
     def writes(out: sbinary.Output, value: Write) {
@@ -30,9 +36,6 @@ object SBinaryScalaz {
     def fmap[A, B](r: WriteM[A], f: scala.Function1[A, B]): WriteM[B] = WriteM(f(r.v), r.f)
   }
 
-  def write[T](t: T)(implicit wr: Writes[T]): Write = WriteM((), o => wr.writes(o, t))
-
-  // TODO: replace with whatever from sbinary
   implicit val ReadsPure: Pure[Reads] = new Pure[Reads] {
     def pure[A](a: => A): Reads[A] = new Reads[A] {
       def reads(in: sbinary.Input): A = a
