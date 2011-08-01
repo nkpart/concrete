@@ -105,6 +105,8 @@ object SafeCopy {
     getSafePut >>= (putter => putter(a))
   }
 
+  def contain[A](a: A): Contained[A] = Contained(a)
+
   def extension[A, B](implicit sc: SafeCopy[A], m: Migrate[A, B]): Kind[A] = Extends(m)
 
   def base[A]: Kind[A] = Base()
@@ -119,22 +121,13 @@ object SafeCopy {
   }
 
   def getSafePut[A](implicit sc: SafeCopy[A]): WriteM[A => Write] = {
-    checkConsistency({
+    Consistency.checkConsistency(sc.internalConsistency, {
       sc.kind match {
         case Primitive() => ((a: A) => sc.putCopy(a).unsafeGet).pure[WriteM]
         case _ => write(sc.version) >|> ((a: A) => sc.putCopy(a).unsafeGet).pure[WriteM]
       }
     })
   }
-
-  def contain[A](a: A): Contained[A] = Contained(a)
-
-  // PRIVATES?
-  def checkConsistency[A, B, M[_]](ks: M[B])(implicit sc: SafeCopy[A], m: Monad[M]): M[B] = sc.internalConsistency match {
-    case NotConsistent(msg) => error(msg) // TODO: this is `fail` on monad in SafeCopy.
-    case Consistent => ks
-  }
-
 }
 
 case class Version(value: Int) extends NewType[Int]
@@ -151,11 +144,16 @@ object Version {
 
 case class Contained[A](unsafeGet: A)
 
-trait Consistency
-
+sealed trait Consistency
 case object Consistent extends Consistency
-
 case class NotConsistent(reason: String) extends Consistency
+
+object Consistency {
+  def checkConsistency[A, B, M[_]](consistency: Consistency, ks: M[B])(implicit m: Monad[M]): M[B] = consistency match {
+    case NotConsistent(msg) => error(msg) // TODO: this is `fail` on monad in SafeCopy.
+    case Consistent => ks
+  }
+}
 
 object Instances {
   import SafeCopy._
@@ -169,13 +167,8 @@ object Instances {
 
   implicit def Tuple2SafeCopy[A, B](implicit sa: SafeCopy[A], sb: SafeCopy[B]): SafeCopy[(A, B)] = new SafeCopy[Tuple2[A, B]] {
     override val kind = primitive[(A, B)]
-    val getCopy = contain {
-      ((a: A, b: B) => (a, b)).lift[Reads].apply(safeGet[A], safeGet[B])
-    }
-
-    def putCopy(t2: (A, B)) = contain {
-      safePut(t2._1) >|> safePut(t2._2)
-    }
+    val getCopy = contain((Tuple2.apply[A,B] _).lift[Reads].apply(safeGet, safeGet))
+    def putCopy(t2: (A, B)) = contain(safePut(t2._1) >|> safePut(t2._2))
   }
 
   implicit def ListSC[A](implicit sc: SafeCopy[A]): SafeCopy[List[A]] = new SafeCopy[List[A]] {
